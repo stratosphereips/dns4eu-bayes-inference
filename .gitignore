@@ -1,0 +1,5 @@
+venv
+*.swp
+Experiments
+.DS_Store
+*.ipynb
