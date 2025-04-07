@@ -4,12 +4,21 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import arviz as az
 import ast
+import re
 from scipy.stats import entropy as shannon_entropy
 from collections import Counter
 
 # -------------------------------
 # Helper functions
 # -------------------------------
+def parse_list_safely(x):
+    if isinstance(x, list):
+        return x
+    try:
+        return ast.literal_eval(x)
+    except Exception:
+        return re.findall(r"[\d\.]+", str(x))
+
 def safe_entropy(seq):
     if len(seq) == 0:
         return 0
@@ -27,26 +36,24 @@ def iqr(x):
     return q75 - q25
 
 # -------------------------------
-# Load and process data
+# Load and preprocess data
 # -------------------------------
 data = pd.read_csv("dns_summary.csv")
 
-# Handle missing values
+# Parse and clean
 data["is_in_TI"] = data["is_in_TI"].fillna(0)
 data["is_in_tranco"] = data["is_in_tranco"].fillna(0)
+data["ttls"] = data["ttls"].apply(parse_list_safely)
+data["answer_ips"] = data["answer_ips"].apply(parse_list_safely)
 
-# Parse raw list fields
-data["ttls"] = data["ttls"].apply(ast.literal_eval)
-data["answer_ips"] = data["answer_ips"].apply(ast.literal_eval)
-
-# Derived features from raw fields
+# Derived features
 data["ttl_range"] = data["ttls"].apply(safe_range)
 data["ttl_entropy"] = data["ttls"].apply(safe_entropy)
 data["ttl_iqr"] = data["ttls"].apply(iqr)
 data["ips_entropy"] = data["answer_ips"].apply(safe_entropy)
 data["ips_count"] = data["answer_ips"].apply(lambda x: len(set(x)))
 
-# Final feature set (normalized below)
+# Final feature list
 features = [
     "num_requests", "min_ttl", "max_ttl", "avg_ttl", "stddev_ttl",
     "num_ips", "dominant_frequency", "total_power", "peak_magnitude",
@@ -70,24 +77,32 @@ X_norm = (X - X_mean) / X_std
 with pm.Model() as model:
     theta = pm.Beta("theta", alpha=1, beta=1)
 
-    # Latent malicious label for each domain
+    # Latent label per domain
     malicious = pm.Bernoulli("malicious", p=theta, shape=N)
 
-    # Feature distributions conditioned on class
-    mu_0 = pm.Normal("mu_0", mu=0, sigma=2, shape=X.shape[1])  # benign
-    mu_1 = pm.Normal("mu_1", mu=0, sigma=2, shape=X.shape[1])  # malicious
-    sigma = pm.HalfNormal("sigma", sigma=1, shape=X.shape[1])  # shared std
+    # Feature priors (tightened for stability)
+    mu_0 = pm.Normal("mu_0", mu=0, sigma=1, shape=X.shape[1])
+    mu_1 = pm.Normal("mu_1", mu=0, sigma=1, shape=X.shape[1])
+    sigma = pm.HalfNormal("sigma", sigma=1, shape=X.shape[1])
 
-    # Per-row conditional mean
+    # Mixture of class-based distributions
     mu = mu_0 * (1 - malicious[:, None]) + mu_1 * malicious[:, None]
 
     # Likelihood
     X_obs = pm.Normal("X_obs", mu=mu, sigma=sigma, observed=X_norm)
 
-    trace = pm.sample(1000, tune=1000, chains=4, target_accept=0.99, max_treedepth=20, progressbar=True)
+    # Improved sampling
+    trace = pm.sample(
+        draws=1000,
+        tune=1000,
+        chains=4,
+        target_accept=0.99,
+        nuts={"max_treedepth": 15},
+        progressbar=True
+    )
 
 # -------------------------------
-# Posterior output
+# Posterior analysis
 # -------------------------------
 posterior_m = trace.posterior["malicious"].mean(dim=["chain", "draw"]).values
 data["p_malicious"] = posterior_m
@@ -112,3 +127,33 @@ plt.title("Feature Means by Class (Benign vs Malicious)")
 plt.tight_layout()
 plt.show()
 
+# -------------------------------
+# ArviZ diagnostics
+# -------------------------------
+summary = az.summary(trace, var_names=["theta", "mu_0", "mu_1", "sigma"])
+print("\n📋 Diagnostic Summary:\n", summary)
+az.plot_trace(trace, var_names=["theta", "mu_0", "mu_1"])
+plt.tight_layout()
+plt.show()
+
+# -------------------------------
+# Print + Log final results
+# -------------------------------
+output_file = "maliciousness_report.csv"
+columns_to_show = ["query", "p_malicious"] + features
+
+final_report = data[columns_to_show].sort_values("p_malicious", ascending=False)
+
+# Print to console
+print("\n🔍 Final Domain Maliciousness Probabilities:\n")
+for _, row in final_report.iterrows():
+    print(f"{row['query']:<25}  P(malicious) = {row['p_malicious']:.3f}")
+
+# Save to CSV
+final_report.to_csv(output_file, index=False)
+print(f"\n✅ Full report saved to: {output_file}")
+
+# Save artifacts after main training script
+az.to_netcdf(trace, "trace.nc")
+np.save("X_mean.npy", X_mean)
+np.save("X_std.npy", X_std)
