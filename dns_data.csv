@@ -1,0 +1,5 @@
+domain,TTL,num_clients,ti_flag
+google.com,300,25,0
+malicious-example.xyz,60,3,1
+abc.def,120,5,
+suspicious.biz,30,1,
