@@ -5,19 +5,41 @@ import matplotlib.pyplot as plt
 import arviz as az
 import ast
 import re
+import argparse
+import os
+from datetime import datetime
 from scipy.stats import entropy as shannon_entropy
 from collections import Counter
 
 # -------------------------------
+# CLI argument for output dir
+# -------------------------------
+parser = argparse.ArgumentParser()
+parser.add_argument("--output_dir", type=str, default="output", help="Output folder to store results")
+args = parser.parse_args()
+os.makedirs(args.output_dir, exist_ok=True)
+
+# -------------------------------
 # Helper functions
 # -------------------------------
+def is_number(s):
+    try:
+        float(s)
+        return True
+    except:
+        return False
+
 def parse_list_safely(x):
     if isinstance(x, list):
-        return x
+        return [float(i) for i in x if is_number(i)]
     try:
-        return ast.literal_eval(x)
+        parsed = ast.literal_eval(x)
+        if isinstance(parsed, list):
+            return [float(i) for i in parsed if is_number(i)]
     except Exception:
-        return re.findall(r"[\d\.]+", str(x))
+        pass
+    # fallback to regex only if valid numbers exist
+    return [float(i) for i in re.findall(r"\d+(?:\.\d+)?", str(x))]
 
 def safe_entropy(seq):
     if len(seq) == 0:
@@ -38,7 +60,21 @@ def iqr(x):
 # -------------------------------
 # Load and preprocess data
 # -------------------------------
-data = pd.read_csv("dns_summary.csv")
+data = pd.read_csv("output_data.csv")
+
+# -------------------------------
+# Handle optional features
+# -------------------------------
+
+# If 'is_in_TI' is missing, add it and set to 0
+if "is_in_TI" not in data.columns:
+    print("⚠️ 'is_in_TI' not found in data — filling with 0")
+    data["is_in_TI"] = 0
+    data["is_in_tranco"] = 0
+
+# Parse list fields safely before any derived operations
+data["ttls"] = data["ttls"].apply(parse_list_safely)
+data["answer_ips"] = data["answer_ips"].apply(parse_list_safely)
 
 # Parse and clean
 data["is_in_TI"] = data["is_in_TI"].fillna(0)
@@ -53,14 +89,29 @@ data["ttl_iqr"] = data["ttls"].apply(iqr)
 data["ips_entropy"] = data["answer_ips"].apply(safe_entropy)
 data["ips_count"] = data["answer_ips"].apply(lambda x: len(set(x)))
 
-# Final feature list
+# -------------------------------
+# Feature list including clustering flags
+# -------------------------------
 features = [
     "num_requests", "min_ttl", "max_ttl", "avg_ttl", "stddev_ttl",
     "num_ips", "dominant_frequency", "total_power", "peak_magnitude",
     "mean_magnitude", "spectral_entropy", "ip_sharing_count",
     "ttl_unique_count", "domain_entropy", "is_in_TI", "is_in_tranco",
-    "ttl_range", "ttl_entropy", "ttl_iqr", "ips_entropy", "ips_count"
+    "ttl_range", "ttl_entropy", "ttl_iqr", "ips_entropy", "ips_count",
+    "in_gmm_cluster", "in_iso_forest_cluster", "in_dbscan_cluster"
 ]
+
+# Check for missing new features
+for f in ["in_gmm_cluster", "in_iso_forest_cluster", "in_dbscan_cluster"]:
+    if f not in data.columns:
+        raise ValueError(f"Missing required column: {f}")
+
+fft_features = [
+    "dominant_frequency", "total_power", "peak_magnitude",
+    "mean_magnitude", "spectral_entropy"
+]
+
+data[fft_features] = data[fft_features].fillna(0)
 
 X = data[features].values
 N = len(data)
@@ -71,35 +122,52 @@ X_std = X.std(axis=0)
 X_std[X_std == 0] = 1
 X_norm = (X - X_mean) / X_std
 
+import numpy as np
+
+nan_rows = np.isnan(X_norm).any(axis=1)
+nan_cols = np.isnan(X_norm).any(axis=0)
+
+print("🧪 Rows with NaNs:")
+print(data[nan_rows][features])
+
+
+print("\n🧪 Columns with NaNs:")
+for i, is_nan in enumerate(nan_cols):
+    if is_nan:
+        print(f" - {features[i]}")
+
 # -------------------------------
 # Bayesian model
 # -------------------------------
 with pm.Model() as model:
     theta = pm.Beta("theta", alpha=1, beta=1)
 
-    # Latent label per domain
     malicious = pm.Bernoulli("malicious", p=theta, shape=N)
 
-    # Feature priors (tightened for stability)
     mu_0 = pm.Normal("mu_0", mu=0, sigma=1, shape=X.shape[1])
     mu_1 = pm.Normal("mu_1", mu=0, sigma=1, shape=X.shape[1])
     sigma = pm.HalfNormal("sigma", sigma=1, shape=X.shape[1])
 
-    # Mixture of class-based distributions
     mu = mu_0 * (1 - malicious[:, None]) + mu_1 * malicious[:, None]
 
-    # Likelihood
     X_obs = pm.Normal("X_obs", mu=mu, sigma=sigma, observed=X_norm)
 
-    # Improved sampling
+    if np.isnan(X_norm).any():
+        raise ValueError("❌ X_norm contains NaNs! Check your preprocessing and feature computation.")
+
     trace = pm.sample(
         draws=1000,
         tune=1000,
-        chains=4,
+        #chains=2,  # reduce for debugging
+        chains=4,  # reduce for debugging
+        #cores=2,
+        cores=4,
+        init="adapt_diag",
         target_accept=0.99,
         nuts={"max_treedepth": 15},
         progressbar=True
     )
+
 
 # -------------------------------
 # Posterior analysis
@@ -117,7 +185,8 @@ plt.xlabel("P(domain is malicious)")
 plt.title("Posterior Probability of Maliciousness per Domain")
 plt.tight_layout()
 plt.gca().invert_yaxis()
-plt.show()
+plt.savefig(os.path.join(args.output_dir, "posterior_maliciousness.png"))
+plt.close()
 
 # -------------------------------
 # Plot: Feature means by class
@@ -125,35 +194,42 @@ plt.show()
 az.plot_forest(trace, var_names=["mu_0", "mu_1"], combined=True)
 plt.title("Feature Means by Class (Benign vs Malicious)")
 plt.tight_layout()
-plt.show()
+plt.savefig(os.path.join(args.output_dir, "feature_means_forest.png"))
+plt.close()
 
 # -------------------------------
-# ArviZ diagnostics
+# Trace diagnostics
 # -------------------------------
-summary = az.summary(trace, var_names=["theta", "mu_0", "mu_1", "sigma"])
-print("\n📋 Diagnostic Summary:\n", summary)
 az.plot_trace(trace, var_names=["theta", "mu_0", "mu_1"])
 plt.tight_layout()
-plt.show()
+plt.savefig(os.path.join(args.output_dir, "trace_diagnostics.png"))
+plt.close()
 
 # -------------------------------
-# Print + Log final results
+# Summary + log
 # -------------------------------
-output_file = "maliciousness_report.csv"
-columns_to_show = ["query", "p_malicious"] + features
+output_file = os.path.join(args.output_dir, "maliciousness_report.csv")
+final_report = data[["query", "p_malicious"] + features].sort_values("p_malicious", ascending=False)
+final_report.to_csv(output_file, index=False)
 
-final_report = data[columns_to_show].sort_values("p_malicious", ascending=False)
+log_file = os.path.join(args.output_dir, "run_log.md")
+with open(log_file, "w") as f:
+    f.write(f"# Run Log: Bayesian DNS Analysis\n")
+    f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    f.write(f"Domains analyzed: {len(data)}\n")
+    f.write(f"Features used: {', '.join(features)}\n")
+    f.write(f"Output files:\n")
+    f.write(f"- maliciousness_report.csv\n")
+    f.write(f"- posterior_maliciousness.png\n")
+    f.write(f"- feature_means_forest.png\n")
+    f.write(f"- trace_diagnostics.png\n")
 
+# -------------------------------
 # Print to console
+# -------------------------------
 print("\n🔍 Final Domain Maliciousness Probabilities:\n")
 for _, row in final_report.iterrows():
     print(f"{row['query']:<25}  P(malicious) = {row['p_malicious']:.3f}")
 
-# Save to CSV
-final_report.to_csv(output_file, index=False)
-print(f"\n✅ Full report saved to: {output_file}")
+print(f"\n✅ Outputs saved in: {args.output_dir}")
 
-# Save artifacts after main training script
-az.to_netcdf(trace, "trace.nc")
-np.save("X_mean.npy", X_mean)
-np.save("X_std.npy", X_std)
