@@ -9,7 +9,6 @@ import re
 from scipy.stats import norm
 from collections import Counter
 from scipy.stats import entropy as shannon_entropy
-from tqdm import tqdm
 import time
 
 parser = argparse.ArgumentParser()
@@ -56,8 +55,8 @@ def iqr(x):
     return q75 - q25
 
 start_time = time.time()
-
-df = pd.read_csv(args.input_file)
+original_df = pd.read_csv(args.input_file)
+df = original_df.copy()
 
 if "ttls" in df.columns:
     df["ttls"] = df["ttls"].apply(parse_list_safely)
@@ -78,12 +77,10 @@ if "is_in_TI" not in df.columns:
 if "is_in_tranco" not in df.columns:
     df["is_in_tranco"] = 0
 
-# Load normalization stats
 X_mean = np.load(f"{args.mean_std_dir}/X_mean.npy")
 X_std = np.load(f"{args.mean_std_dir}/X_std.npy")
 X_std[X_std == 0] = 1
 
-# Match features dynamically
 all_possible_features = [
     "num_requests", "min_ttl", "max_ttl", "avg_ttl", "stddev_ttl",
     "num_ips", "dominant_frequency", "total_power", "peak_magnitude",
@@ -92,12 +89,10 @@ all_possible_features = [
     "ttl_range", "ttl_entropy", "ttl_iqr", "ips_entropy", "ips_count",
     "in_gmm_cluster", "in_isoforest_cluster", "in_dbscan_cluster"
 ]
-
 features = [f for f in all_possible_features if f in df.columns][:X_mean.shape[0]]
 X = df[features].fillna(0).astype(float).values
 X_norm = (X - X_mean) / X_std
 
-# Load posterior
 trace = az.from_netcdf(args.trace_file)
 theta_samples_raw = trace.posterior["theta"].stack(sample=("chain", "draw")).values.flatten()
 mu_0_samples = trace.posterior["mu_0"].stack(sample=("chain", "draw")).values
@@ -105,26 +100,28 @@ mu_1_samples = trace.posterior["mu_1"].stack(sample=("chain", "draw")).values
 sigma_samples = trace.posterior["sigma"].stack(sample=("chain", "draw")).values
 
 S = mu_0_samples.shape[1]
-results = []
+theta_1 = theta_samples_raw[:S]
+theta_0 = 1 - theta_1
 
-print(f"🔍 Performing inference on {X_norm.shape[0]} domains with {S} posterior samples...")
+X_norm = X_norm.astype(np.float32)
+mu_0_samples = mu_0_samples[:, :S].astype(np.float32).T
+mu_1_samples = mu_1_samples[:, :S].astype(np.float32).T
+sigma_samples = sigma_samples[:, :S].astype(np.float32).T
 
-for x in tqdm(X_norm, desc="🔄 Inference progress"):
-    logp_ratios = []
-    for i in range(S):
-        mu_0 = mu_0_samples[:, i]
-        mu_1 = mu_1_samples[:, i]
-        sigma = sigma_samples[:, i]
-        theta_1 = theta_samples_raw[i]
-        theta_0 = 1 - theta_1
-        logp_0 = norm.logpdf(x, mu_0, sigma).sum()
-        logp_1 = norm.logpdf(x, mu_1, sigma).sum()
-        logp_ratio = logp_1 + np.log(theta_1) - (logp_0 + np.log(theta_0))
-        logp_ratios.append(logp_ratio)
-    results.append((np.array(logp_ratios) > 0).mean())
+def compute_log_probs(X, mu, sigma):
+    part1 = -0.5 * np.sum(((X[:, None, :] - mu[None, :, :]) / sigma[None, :, :]) ** 2, axis=2)
+    part2 = -np.sum(np.log(np.sqrt(2 * np.pi) * sigma), axis=1)
+    return part1 + part2
 
-df["prob_malicious"] = results
-df.to_csv(args.output_file, index=False)
+log_probs_malicious = compute_log_probs(X_norm, mu_1_samples, sigma_samples)
+log_probs_benign = compute_log_probs(X_norm, mu_0_samples, sigma_samples)
+log_theta_ratio = np.log(theta_1) - np.log(theta_0)
+
+log_ratios = log_probs_malicious + log_theta_ratio - log_probs_benign
+prob_malicious = (log_ratios > 0).mean(axis=1)
+
+original_df["prob_malicious"] = prob_malicious
+original_df.to_csv(args.output_file, index=False)
 
 elapsed = time.time() - start_time
 print(f"✅ Saved predictions to {args.output_file}")
