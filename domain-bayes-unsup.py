@@ -158,8 +158,8 @@ with pm.Model() as model:
     trace = pm.sample(
         draws=1000,
         tune=1000,
-        #chains=2,  # reduce for debugging
-        chains=4,  # reduce for debugging
+        chains=2,  # reduce for debugging
+        #chains=4,  # reduce for debugging
         #cores=2,
         cores=4,
         init="adapt_diag",
